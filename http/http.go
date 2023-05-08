@@ -2,184 +2,393 @@ package http
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"time"
 )
 
-type HttpRequest struct {
-	Method   string
-	Url      string
-	Form     *map[string]string
-	Params   *map[string]string
-	Headers  *map[string]string
-	Json     *map[string]interface{}
-	Body     []byte
-	request  *http.Request
-	Response *http.Response
-	Result   []byte
-	//LoggerPrint bool
-	cookies []*http.Cookie
+type Client struct {
+	HttpClient       *http.Client
+	Transport        *http.Transport
+	Header           http.Header
+	Timeout          time.Duration
+	Host             string
+	bodySize         int // body size limit(MB), default is 10MB
+	url              string
+	method           string
+	requestType      RequestType
+	FormString       string
+	ContentType      string
+	unmarshalType    string
+	multipartBodyMap map[string]interface{}
+	jsonByte         []byte
+	err              error
+	Result           []byte
 }
 
-func (h *HttpRequest) SetHeader(key string, value string) *HttpRequest {
-	if h.Headers == nil {
-		h.Headers = &map[string]string{}
+// NewClient , default tls.Config{InsecureSkipVerify: true}
+func NewClient() (client *Client) {
+
+	client = &Client{
+		HttpClient: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+				DisableKeepAlives: true,
+				Proxy:             http.ProxyFromEnvironment,
+			},
+		},
+		Transport:     nil,
+		Header:        make(http.Header),
+		bodySize:      10, // default is 10MB
+		requestType:   TypeJSON,
+		unmarshalType: string(TypeJSON),
 	}
-	(*h.Headers)[key] = value
-	return h
+	return client
 }
 
-func (h *HttpRequest) SetParams(key string, value string) *HttpRequest {
-	if h.Params == nil {
-		h.Params = &map[string]string{}
+func (c *Client) SetTransport(transport *http.Transport) (client *Client) {
+	c.Transport = transport
+	return c
+}
+
+func (c *Client) SetTLSConfig(tlsCfg *tls.Config) (client *Client) {
+	c.Transport = &http.Transport{TLSClientConfig: tlsCfg, DisableKeepAlives: true, Proxy: http.ProxyFromEnvironment}
+	return c
+}
+
+func (c *Client) SetTimeout(timeout time.Duration) (client *Client) {
+	c.Timeout = timeout
+	return c
+}
+
+func (c *Client) SetHost(host string) (client *Client) {
+	c.Host = host
+	return c
+}
+
+// set body size (MB), default is 10MB
+func (c *Client) SetBodySize(sizeMB int) (client *Client) {
+	c.bodySize = sizeMB
+	return c
+}
+
+func (c *Client) Type(typeStr RequestType) (client *Client) {
+	if _, ok := types[typeStr]; ok {
+		c.requestType = typeStr
 	}
-	(*h.Params)[key] = value
-	return h
+	return c
 }
 
-func (h *HttpRequest) SetForm(key string, value string) *HttpRequest {
-	if h.Form == nil {
-		h.Form = &map[string]string{}
+func (c *Client) Get(url string) (client *Client) {
+	c.method = GET
+	c.url = url
+	return c
+}
+
+func (c *Client) Post(url string) (client *Client) {
+	c.method = POST
+	c.url = url
+	return c
+}
+
+func (c *Client) Put(url string) (client *Client) {
+	c.method = PUT
+	c.url = url
+	return c
+}
+
+func (c *Client) Delete(url string) (client *Client) {
+	c.method = DELETE
+	c.url = url
+	return c
+}
+
+func (c *Client) Patch(url string) (client *Client) {
+	c.method = PATCH
+	c.url = url
+	return c
+}
+
+func (c *Client) SendStruct(v interface{}) (client *Client) {
+	if v == nil {
+		return c
 	}
-	(*h.Form)[key] = value
-	return h
-}
-
-func (h *HttpRequest) SetJson(key string, value interface{}) *HttpRequest {
-	if h.Json == nil {
-		h.Json = &map[string]interface{}{}
+	bs, err := json.Marshal(v)
+	if err != nil {
+		c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, v)
+		return c
 	}
-	(*h.Json)[key] = value
-	return h
+	switch c.requestType {
+	case TypeJSON:
+		c.jsonByte = bs
+	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
+		body := make(map[string]interface{})
+		if err = json.Unmarshal(bs, &body); err != nil {
+			c.err = fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
+			return c
+		}
+		c.FormString = FormatURLParam(body)
+	}
+	return c
 }
 
-func (h *HttpRequest) JsonDumps() ([]byte, error) {
-	row, err := json.Marshal(h.Json)
-	return row, err
+func (c *Client) SendBodyMap(bm map[string]interface{}) (client *Client) {
+	if bm == nil {
+		return c
+	}
+	switch c.requestType {
+	case TypeJSON:
+		bs, err := json.Marshal(bm)
+		if err != nil {
+			c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, bm)
+			return c
+		}
+		c.jsonByte = bs
+	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
+		c.FormString = FormatURLParam(bm)
+	}
+	return c
 }
 
-func (h *HttpRequest) SetBody(data []byte) {
-	h.Body = data
+func (c *Client) SendMultipartBodyMap(bm map[string]interface{}) (client *Client) {
+	if bm == nil {
+		return c
+	}
+	switch c.requestType {
+	case TypeJSON:
+		bs, err := json.Marshal(bm)
+		if err != nil {
+			c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, bm)
+			return c
+		}
+		c.jsonByte = bs
+	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
+		c.FormString = FormatURLParam(bm)
+	case TypeMultipartFormData:
+		c.multipartBodyMap = bm
+	}
+	return c
 }
 
-func (h *HttpRequest) SetCookie(cookie *http.Cookie) {
-	h.cookies = append(h.cookies, cookie)
+// encodeStr: url.Values.Encode() or jsonBody
+func (c *Client) SendString(encodeStr string) (client *Client) {
+	switch c.requestType {
+	case TypeJSON:
+		c.jsonByte = []byte(encodeStr)
+	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
+		c.FormString = encodeStr
+	}
+	return c
 }
 
-func (h *HttpRequest) UrlParse() {
-	path, _ := url.Parse(h.Url)
-	h.Url = fmt.Sprintf("%s://%s%s", path.Scheme, path.Host, path.Path)
+func (c *Client) EndStruct(ctx context.Context, v interface{}) (res *http.Response, err error) {
+	res, bs, err := c.EndBytes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return res, fmt.Errorf("StatusCode(%d) != 200", res.StatusCode)
+	}
 
-	if len(path.RawQuery) > 0 {
-		for _, item := range strings.Split(path.RawQuery, "&") {
-			p := strings.Split(item, "=")
-			tmp, _ := url.QueryUnescape(p[1])
-			h.SetParams(p[0], tmp)
+	switch c.unmarshalType {
+	case string(TypeJSON):
+		err = json.Unmarshal(bs, &v)
+		if err != nil {
+			return nil, fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
+		}
+		return res, nil
+	case string(TypeXML):
+		err = xml.Unmarshal(bs, &v)
+		if err != nil {
+			return nil, fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
+		}
+		return res, nil
+	default:
+		return nil, errors.New("unmarshalType Type Wrong")
+	}
+}
+
+func (c *Client) Do() (*http.Response, error) {
+	res, bs, err := c.EndBytes(context.Background())
+	c.Result = bs
+	c.err = err
+	return res, c.err
+}
+
+func (c *Client) DoMustSuccess() (*http.Response, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	res, bs, err := c.EndBytes(context.Background())
+	c.Result = bs
+	c.err = err
+	if c.err != nil {
+		if res != nil && res.StatusCode != http.StatusOK {
+			c.err = errors.New(fmt.Sprintf("http error [%d]", res.StatusCode))
 		}
 	}
+	return res, c.err
 }
 
-func (h *HttpRequest) Do() error {
-
-	if err := h.structureRequest(); err != nil {
-		return err
+func (c *Client) EndBytes(ctx context.Context) (res *http.Response, bs []byte, err error) {
+	if c.err != nil {
+		return nil, nil, c.err
 	}
-
 	var (
-		client http.Client
-		err    error
+		body io.Reader
+		bw   *multipart.Writer
 	)
-
-	if h.Response, err = client.Do(h.request); err != nil {
-		return err
+	// multipart-form-data
+	if c.requestType == TypeMultipartFormData {
+		body = &bytes.Buffer{}
+		bw = multipart.NewWriter(body.(io.Writer))
 	}
 
-	defer func() {
-		_ = h.Response.Body.Close()
-	}()
-	h.Result, err = ioutil.ReadAll(h.Response.Body)
-	if err != nil {
-		return err
+	if len(c.method) <= 0 {
+		c.method = GET
 	}
 
-	//fmt.Println(string(h.Result))
-	if h.Response.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("status %d error!", h.Response.StatusCode))
-	}
-	return err
-}
-
-func (h *HttpRequest) To(v interface{}) error {
-	if err := json.Unmarshal(h.Result, v); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (h *HttpRequest) structureRequest() error {
-
-	var err error
-	baseUrl, err := url.Parse(h.Url)
-	if err != nil {
-		return err
-	}
-
-	if len(h.Method) <= 0 {
-		h.Method = "GET"
-	}
-
-	p := url.Values{}
-	if h.Params != nil {
-		for k, v := range *h.Params {
-			p.Add(k, v)
+	reqFunc := func() (err error) {
+		switch c.method {
+		case GET:
+			switch c.requestType {
+			case TypeJSON:
+				c.ContentType = types[TypeJSON]
+			case TypeForm, TypeFormData, TypeUrlencoded:
+				c.ContentType = types[TypeForm]
+			case TypeMultipartFormData:
+				c.ContentType = bw.FormDataContentType()
+			case TypeXML:
+				c.ContentType = types[TypeXML]
+				c.unmarshalType = string(TypeXML)
+			default:
+				return errors.New("Request type Error ")
+			}
+		case POST, PUT, DELETE, PATCH:
+			switch c.requestType {
+			case TypeJSON:
+				if c.jsonByte != nil {
+					body = strings.NewReader(string(c.jsonByte))
+				}
+				c.ContentType = types[TypeJSON]
+			case TypeForm, TypeFormData, TypeUrlencoded:
+				body = strings.NewReader(c.FormString)
+				c.ContentType = types[TypeForm]
+			case TypeMultipartFormData:
+				for k, v := range c.multipartBodyMap {
+					// file 参数
+					if file, ok := v.(*File); ok {
+						fw, err := bw.CreateFormFile(k, file.Name)
+						if err != nil {
+							return err
+						}
+						_, _ = fw.Write(file.Content)
+						continue
+					}
+					// text 参数
+					vs, ok2 := v.(string)
+					if ok2 {
+						_ = bw.WriteField(k, vs)
+					} else if ss := convertToString(v); ss != "" {
+						_ = bw.WriteField(k, ss)
+					}
+				}
+				_ = bw.Close()
+				c.ContentType = bw.FormDataContentType()
+			case TypeXML:
+				body = strings.NewReader(c.FormString)
+				c.ContentType = types[TypeXML]
+				c.unmarshalType = string(TypeXML)
+			default:
+				return errors.New("Request type Error ")
+			}
+		default:
+			return errors.New("Only support GET and POST and PUT and DELETE ")
 		}
-	}
-	baseUrl.RawQuery = p.Encode()
 
-	var body io.Reader
-
-	if h.Body != nil {
-		body = bytes.NewBuffer(h.Body)
-	} else if h.Json != nil {
-		tmpBody, err := h.JsonDumps()
+		req, err := http.NewRequestWithContext(ctx, c.method, c.url, body)
 		if err != nil {
 			return err
 		}
-		body = bytes.NewBuffer(tmpBody)
-	} else {
-		d := url.Values{}
-		if h.Form != nil {
-			for k, v := range *h.Form {
-				d.Add(k, v)
-			}
+		req.Header = c.Header
+		req.Header.Set("Content-Type", c.ContentType)
+		if c.Transport != nil {
+			c.HttpClient.Transport = c.Transport
 		}
-		body = bytes.NewBufferString(d.Encode())
+		if c.Host != "" {
+			req.Host = c.Host
+		}
+		if c.Timeout > 0 {
+			c.HttpClient.Timeout = c.Timeout
+		}
+		res, err = c.HttpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer res.Body.Close()
+		bs, err = ioutil.ReadAll(io.LimitReader(res.Body, int64(c.bodySize<<20))) // default 10MB change the size you want
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 
-	u := baseUrl.String()
-
-	h.request, err = http.NewRequest(h.Method, u, body)
-	if err != nil {
-		return err
+	if err = reqFunc(); err != nil {
+		return nil, nil, err
 	}
+	return res, bs, nil
+}
 
-	if len(h.cookies) > 0 {
-		for _, v := range h.cookies {
-			h.request.AddCookie(v)
+func FormatURLParam(body map[string]interface{}) (urlParam string) {
+	var (
+		buf  strings.Builder
+		keys []string
+	)
+	for k := range body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v, ok := body[k].(string)
+		if !ok {
+			v = convertToString(body[k])
+		}
+		if v != "" {
+			buf.WriteString(url.QueryEscape(k))
+			buf.WriteByte('=')
+			buf.WriteString(url.QueryEscape(v))
+			buf.WriteByte('&')
 		}
 	}
-
-	if h.Headers != nil {
-		for k, v := range *h.Headers {
-			h.request.Header.Set(k, v)
-		}
+	if buf.Len() <= 0 {
+		return ""
 	}
+	return buf.String()[:buf.Len()-1]
+}
 
-	return nil
+func convertToString(v interface{}) (str string) {
+	if v == nil {
+		return ""
+	}
+	var (
+		bs  []byte
+		err error
+	)
+	if bs, err = json.Marshal(v); err != nil {
+		return ""
+	}
+	str = string(bs)
+	return
 }
