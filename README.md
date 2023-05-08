@@ -12,9 +12,11 @@ import (
 )
 
 func main() {
-	req := http.HttpRequest{
-		Url: "https://www.baidu.com",
-	}
+
+	req := http.New(
+		http.WithUrl("http://www.baidu.com"),
+	)
+
 	if err := req.Do(); err != nil {
 		panic(err)
 	}

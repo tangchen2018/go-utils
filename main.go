@@ -7,10 +7,13 @@ import (
 
 func main() {
 
-	c := http.NewClient().Get("http://www.baidu.com")
-	_, err := c.DoMustSuccess()
-	if err != nil {
+	req := http.New(
+		http.WithUrl("http://www.baidu.com"),
+	)
+
+	if err := req.Do(); err != nil {
 		panic(err)
 	}
-	fmt.Println(string(c.Result))
+
+	fmt.Println(string(req.Result))
 }

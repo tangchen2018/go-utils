@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -13,35 +12,31 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 )
 
-type Client struct {
-	HttpClient       *http.Client
-	Transport        *http.Transport
-	Header           http.Header
-	Timeout          time.Duration
-	Host             string
-	bodySize         int // body size limit(MB), default is 10MB
-	url              string
-	method           string
-	requestType      RequestType
-	FormString       string
-	ContentType      string
-	unmarshalType    string
-	multipartBodyMap map[string]interface{}
-	jsonByte         []byte
-	err              error
-	Result           []byte
+type Request struct {
+	Method      string
+	Url         string
+	Host        string
+	Timeout     time.Duration
+	Header      http.Header
+	Client      *http.Client
+	Transport   *http.Transport
+	requestType RequestType
+	contentType string
+	QueryParams url.Values
+	Body        map[string]interface{}
+	bodySize    int
+	Result      []byte
+	Response    *http.Response
 }
 
-// NewClient , default tls.Config{InsecureSkipVerify: true}
-func NewClient() (client *Client) {
-
-	client = &Client{
-		HttpClient: &http.Client{
+func New(opts ...RequestOption) *Request {
+	req := &Request{
+		Method: GET,
+		Client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -49,356 +44,147 @@ func NewClient() (client *Client) {
 				Proxy:             http.ProxyFromEnvironment,
 			},
 		},
-		Transport:     nil,
-		Header:        make(http.Header),
-		bodySize:      10, // default is 10MB
-		requestType:   TypeJSON,
-		unmarshalType: string(TypeJSON),
+		Transport:   nil,
+		bodySize:    10, // default is 10MB
+		Header:      make(http.Header),
+		requestType: TypeJSON,
 	}
-	return client
-}
-
-func (c *Client) SetTransport(transport *http.Transport) (client *Client) {
-	c.Transport = transport
-	return c
-}
-
-func (c *Client) SetTLSConfig(tlsCfg *tls.Config) (client *Client) {
-	c.Transport = &http.Transport{TLSClientConfig: tlsCfg, DisableKeepAlives: true, Proxy: http.ProxyFromEnvironment}
-	return c
-}
-
-func (c *Client) SetTimeout(timeout time.Duration) (client *Client) {
-	c.Timeout = timeout
-	return c
-}
-
-func (c *Client) SetHost(host string) (client *Client) {
-	c.Host = host
-	return c
-}
-
-// set body size (MB), default is 10MB
-func (c *Client) SetBodySize(sizeMB int) (client *Client) {
-	c.bodySize = sizeMB
-	return c
-}
-
-func (c *Client) Type(typeStr RequestType) (client *Client) {
-	if _, ok := types[typeStr]; ok {
-		c.requestType = typeStr
+	for _, option := range opts {
+		option(req)
 	}
-	return c
+	return req
 }
 
-func (c *Client) SetUrl(url string) (client *Client) {
-	c.url = url
-	return c
-}
-
-func (c *Client) SetMethod(method string) (client *Client) {
-	c.method = method
-	return c
-}
-
-func (c *Client) Get(url string) (client *Client) {
-	c.method = GET
-	c.url = url
-	return c
-}
-
-func (c *Client) Post(url string) (client *Client) {
-	c.method = POST
-	c.url = url
-	return c
-}
-
-func (c *Client) Put(url string) (client *Client) {
-	c.method = PUT
-	c.url = url
-	return c
-}
-
-func (c *Client) Delete(url string) (client *Client) {
-	c.method = DELETE
-	c.url = url
-	return c
-}
-
-func (c *Client) Patch(url string) (client *Client) {
-	c.method = PATCH
-	c.url = url
-	return c
-}
-
-func (c *Client) SendStruct(v interface{}) (client *Client) {
-	if v == nil {
-		return c
+func (p *Request) SetBody(key string, value interface{}) *Request {
+	if p.Body == nil {
+		p.Body = make(map[string]interface{})
 	}
-	bs, err := json.Marshal(v)
-	if err != nil {
-		c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, v)
-		return c
-	}
-	switch c.requestType {
-	case TypeJSON:
-		c.jsonByte = bs
-	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
-		body := make(map[string]interface{})
-		if err = json.Unmarshal(bs, &body); err != nil {
-			c.err = fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
-			return c
-		}
-		c.FormString = FormatURLParam(body)
-	}
-	return c
+	p.Body[key] = value
+	return p
 }
 
-func (c *Client) SendBodyMap(bm map[string]interface{}) (client *Client) {
-	if bm == nil {
-		return c
-	}
-	switch c.requestType {
-	case TypeJSON:
-		bs, err := json.Marshal(bm)
-		if err != nil {
-			c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, bm)
-			return c
-		}
-		c.jsonByte = bs
-	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
-		c.FormString = FormatURLParam(bm)
-	}
-	return c
-}
+func (p *Request) structureRequest() (io.Reader, error) {
 
-func (c *Client) SendMultipartBodyMap(bm map[string]interface{}) (client *Client) {
-	if bm == nil {
-		return c
-	}
-	switch c.requestType {
-	case TypeJSON:
-		bs, err := json.Marshal(bm)
-		if err != nil {
-			c.err = fmt.Errorf("[%w]: %v, value: %v", MarshalErr, err, bm)
-			return c
-		}
-		c.jsonByte = bs
-	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
-		c.FormString = FormatURLParam(bm)
-	case TypeMultipartFormData:
-		c.multipartBodyMap = bm
-	}
-	return c
-}
-
-// encodeStr: url.Values.Encode() or jsonBody
-func (c *Client) SendString(encodeStr string) (client *Client) {
-	switch c.requestType {
-	case TypeJSON:
-		c.jsonByte = []byte(encodeStr)
-	case TypeXML, TypeUrlencoded, TypeForm, TypeFormData:
-		c.FormString = encodeStr
-	}
-	return c
-}
-
-func (c *Client) EndStruct(ctx context.Context, v interface{}) (res *http.Response, err error) {
-	res, bs, err := c.EndBytes(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != http.StatusOK {
-		return res, fmt.Errorf("StatusCode(%d) != 200", res.StatusCode)
+	if len(p.Method) <= 0 {
+		p.Method = GET
 	}
 
-	switch c.unmarshalType {
-	case string(TypeJSON):
-		err = json.Unmarshal(bs, &v)
-		if err != nil {
-			return nil, fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
-		}
-		return res, nil
-	case string(TypeXML):
-		err = xml.Unmarshal(bs, &v)
-		if err != nil {
-			return nil, fmt.Errorf("[%w]: %v, bytes: %s", UnmarshalErr, err, string(bs))
-		}
-		return res, nil
-	default:
-		return nil, errors.New("unmarshalType Type Wrong")
-	}
-}
-
-func (c *Client) Do() (*http.Response, error) {
-	res, bs, err := c.EndBytes(context.Background())
-	c.Result = bs
-	c.err = err
-	return res, c.err
-}
-
-func (c *Client) DoMustSuccess() (*http.Response, error) {
-	if c.err != nil {
-		return nil, c.err
-	}
-	res, bs, err := c.EndBytes(context.Background())
-	c.Result = bs
-	c.err = err
-	if c.err != nil {
-		if res != nil && res.StatusCode != http.StatusOK {
-			c.err = errors.New(fmt.Sprintf("http error [%d]", res.StatusCode))
-		}
-	}
-	return res, c.err
-}
-
-func (c *Client) EndBytes(ctx context.Context) (res *http.Response, bs []byte, err error) {
-	if c.err != nil {
-		return nil, nil, c.err
-	}
 	var (
 		body io.Reader
 		bw   *multipart.Writer
 	)
 	// multipart-form-data
-	if c.requestType == TypeMultipartFormData {
+	if p.requestType == TypeMultipartFormData {
 		body = &bytes.Buffer{}
 		bw = multipart.NewWriter(body.(io.Writer))
 	}
 
-	if len(c.method) <= 0 {
-		c.method = GET
+	if p.QueryParams != nil && len(p.QueryParams) > 0 {
+		p.Url = fmt.Sprintf("%s?%s", p.Url, p.QueryParams.Encode())
 	}
 
-	reqFunc := func() (err error) {
-		switch c.method {
-		case GET:
-			switch c.requestType {
-			case TypeJSON:
-				c.ContentType = types[TypeJSON]
-			case TypeForm, TypeFormData, TypeUrlencoded:
-				c.ContentType = types[TypeForm]
-			case TypeMultipartFormData:
-				c.ContentType = bw.FormDataContentType()
-			case TypeXML:
-				c.ContentType = types[TypeXML]
-				c.unmarshalType = string(TypeXML)
-			default:
-				return errors.New("Request type Error ")
-			}
-		case POST, PUT, DELETE, PATCH:
-			switch c.requestType {
-			case TypeJSON:
-				if c.jsonByte != nil {
-					body = strings.NewReader(string(c.jsonByte))
-				}
-				c.ContentType = types[TypeJSON]
-			case TypeForm, TypeFormData, TypeUrlencoded:
-				body = strings.NewReader(c.FormString)
-				c.ContentType = types[TypeForm]
-			case TypeMultipartFormData:
-				for k, v := range c.multipartBodyMap {
-					// file 参数
-					if file, ok := v.(*File); ok {
-						fw, err := bw.CreateFormFile(k, file.Name)
-						if err != nil {
-							return err
-						}
-						_, _ = fw.Write(file.Content)
-						continue
-					}
-					// text 参数
-					vs, ok2 := v.(string)
-					if ok2 {
-						_ = bw.WriteField(k, vs)
-					} else if ss := convertToString(v); ss != "" {
-						_ = bw.WriteField(k, ss)
-					}
-				}
-				_ = bw.Close()
-				c.ContentType = bw.FormDataContentType()
-			case TypeXML:
-				body = strings.NewReader(c.FormString)
-				c.ContentType = types[TypeXML]
-				c.unmarshalType = string(TypeXML)
-			default:
-				return errors.New("Request type Error ")
-			}
+	switch p.Method {
+	case GET:
+		switch p.requestType {
+		case TypeJSON:
+			p.contentType = types[TypeJSON]
+		case TypeForm, TypeFormData, TypeUrlencoded:
+			p.contentType = types[TypeForm]
+		case TypeMultipartFormData:
+			p.contentType = bw.FormDataContentType()
+		case TypeXML:
+			p.contentType = types[TypeXML]
 		default:
-			return errors.New("Only support GET and POST and PUT and DELETE ")
+			return body, errors.New("Request type Error ")
 		}
+	case POST, PUT, DELETE, PATCH:
+		switch p.requestType {
+		case TypeJSON:
+			if p.Body != nil {
+				if bodyTmp, err := json.Marshal(p.Body); err != nil {
+					return body, errors.New("marshal error")
+				} else {
+					body = strings.NewReader(string(bodyTmp))
+				}
+			}
+			p.contentType = types[TypeJSON]
+		case TypeForm, TypeFormData, TypeUrlencoded:
+			body = strings.NewReader(FormatURLParam(p.Body))
+			p.contentType = types[TypeForm]
 
-		req, err := http.NewRequestWithContext(ctx, c.method, c.url, body)
-		if err != nil {
-			return err
+		case TypeMultipartFormData:
+			for k, v := range p.Body {
+				// file 参数
+				if file, ok := v.(*File); ok {
+					fw, err := bw.CreateFormFile(k, file.Name)
+					if err != nil {
+						return body, err
+					}
+					_, _ = fw.Write(file.Content)
+					continue
+				}
+				// text 参数
+				vs, ok2 := v.(string)
+				if ok2 {
+					_ = bw.WriteField(k, vs)
+				} else if ss := convertToString(v); ss != "" {
+					_ = bw.WriteField(k, ss)
+				}
+			}
+			_ = bw.Close()
+			p.contentType = bw.FormDataContentType()
+		case TypeXML:
+			body = strings.NewReader(FormatURLParam(p.Body))
+			p.contentType = types[TypeXML]
+		default:
+			return body, errors.New("Request type Error ")
 		}
-		req.Header = c.Header
-		req.Header.Set("Content-Type", c.ContentType)
-		if c.Transport != nil {
-			c.HttpClient.Transport = c.Transport
-		}
-		if c.Host != "" {
-			req.Host = c.Host
-		}
-		if c.Timeout > 0 {
-			c.HttpClient.Timeout = c.Timeout
-		}
-		res, err = c.HttpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-		bs, err = ioutil.ReadAll(io.LimitReader(res.Body, int64(c.bodySize<<20))) // default 10MB change the size you want
-		if err != nil {
-			return err
-		}
-		return nil
+	default:
+		return body, errors.New("Only support GET and POST and PUT and DELETE ")
 	}
-
-	if err = reqFunc(); err != nil {
-		return nil, nil, err
-	}
-	return res, bs, nil
+	return body, nil
 }
 
-func FormatURLParam(body map[string]interface{}) (urlParam string) {
-	var (
-		buf  strings.Builder
-		keys []string
-	)
-	for k := range body {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		v, ok := body[k].(string)
-		if !ok {
-			v = convertToString(body[k])
-		}
-		if v != "" {
-			buf.WriteString(url.QueryEscape(k))
-			buf.WriteByte('=')
-			buf.WriteString(url.QueryEscape(v))
-			buf.WriteByte('&')
-		}
-	}
-	if buf.Len() <= 0 {
-		return ""
-	}
-	return buf.String()[:buf.Len()-1]
-}
+func (p *Request) Do() error {
 
-func convertToString(v interface{}) (str string) {
-	if v == nil {
-		return ""
-	}
 	var (
-		bs  []byte
-		err error
+		err  error
+		body io.Reader
+		req  *http.Request
 	)
-	if bs, err = json.Marshal(v); err != nil {
-		return ""
+
+	if body, err = p.structureRequest(); err != nil {
+		return err
 	}
-	str = string(bs)
-	return
+
+	if req, err = http.NewRequestWithContext(context.Background(), p.Method, p.Url, body); err != nil {
+		return err
+	}
+
+	req.Header = p.Header
+
+	req.Header.Set("Content-Type", p.contentType)
+	if p.Transport != nil {
+		p.Client.Transport = p.Transport
+	}
+	if p.Host != "" {
+		req.Host = p.Host
+	}
+	if p.Timeout > 0 {
+		p.Client.Timeout = p.Timeout
+	}
+
+	p.Response, err = p.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = p.Response.Body.Close()
+	}()
+
+	p.Result, err = ioutil.ReadAll(io.LimitReader(p.Response.Body, int64(p.bodySize<<20))) // default 10MB change the size you want
+	if err != nil {
+		return err
+	}
+	return nil
 }
