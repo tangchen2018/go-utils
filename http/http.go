@@ -47,6 +47,7 @@ func New(opts ...RequestOption) *Request {
 		Transport:   nil,
 		bodySize:    10, // default is 10MB
 		Header:      make(http.Header),
+		QueryParams: make(url.Values),
 		requestType: TypeJSON,
 	}
 	for _, option := range opts {
